@@ -206,12 +206,202 @@ async def search_rag(
     )
 
 
+_ARTIFACT_INTENT_PATTERN = re.compile(
+    r"\b(?:generate|create|make|export|build|compile)\b.*?\b(?:excel|spreadsheet|xlsx|sheet|csv|pdf|report|docx|word|pptx|presentation|slides)\b"
+    r"|\b(?:excel|spreadsheet|xlsx|csv)\b.*?\b(?:sheet|file|report|table|log)\b"
+    r"|\b(?:pdf|docx|pptx)\b.*?\b(?:report|file|document|slides)\b",
+    re.IGNORECASE,
+)
+
+
+def _detect_artifact_type(query: str) -> str:
+    q = query.lower()
+    if any(k in q for k in ["excel", "xlsx", "spreadsheet", "csv", "sheet"]):
+        return "xlsx"
+    if any(k in q for k in ["pdf"]):
+        return "pdf"
+    if any(k in q for k in ["docx", "word"]):
+        return "docx"
+    if any(k in q for k in ["pptx", "presentation", "slides", "powerpoint"]):
+        return "pptx"
+    if "report" in q:
+        return "pdf"
+    return "xlsx"
+
+
 @router.post("/qa", response_model=RagQAResponse)
 async def qa_rag(
     req: RagQARequest,
     context: AppContext = Depends(get_app_context),
 ) -> RagQAResponse:
-    """Explicit grounded QA operation: vector retrieval, reranking, and local LLM answer synthesis."""
+    """Adaptive grounded QA & capability execution: routes queries to RAG synthesis or deterministic file artifact generation."""
+    import json
+    import time
+    from apps.api.routers.artifacts import register_artifact
+    from apps.api.schemas.common import ArtifactReferenceSchema
+
+    start_time = time.perf_counter()
+
+    # 1. Adaptive Routing: Detect Artifact Generation Intent
+    if _ARTIFACT_INTENT_PATTERN.search(req.query):
+        art_type = _detect_artifact_type(req.query)
+        candidates: List[RagCandidateSchema] = []
+        context_text = ""
+        retrieval_sec = 0.0
+
+        # If scoped to document or referring to technical knowledge, retrieve context first
+        if req.document_id or any(w in req.query.lower() for w in ["document", "handbook", "manual", "guide", "specs", "rules"]):
+            t_ret = time.perf_counter()
+            try:
+                cap_rag = context.create_rag_capability()
+                rag_search_res = await asyncio.to_thread(
+                    cap_rag.execute,
+                    parameters={"operation": "search", "top_k": 10, "top_n": 4, "document_id": req.document_id},
+                    inputs={"query": req.query},
+                    context=CapabilityContext(execution_id=f"rag-search-ctx-{uuid.uuid4().hex[:8]}"),
+                )
+                retrieval_sec = time.perf_counter() - t_ret
+                out_rag = rag_search_res.output or {}
+                candidates = [RagCandidateSchema(**c) for c in out_rag.get("candidates", [])]
+                context_text = "\n\n".join(c.content for c in candidates[:3])
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning("Context retrieval for artifact generation skipped: %s", e)
+
+        # 2. Extract or Synthesize Structured Schema & Content via LLM
+        t_synth_0 = time.perf_counter()
+        prompt = f"""You are an industrial data synthesis assistant. The user wants to generate a downloadable {art_type.upper()} file.
+User Request: {req.query}
+{f'Reference Documentation Context:\n{context_text}' if context_text else ''}
+
+Respond strictly with a valid JSON object matching this schema:
+{{
+  "title": "Concise title for the file",
+  "filename": "descriptive_name.{art_type}",
+  "summary": "Clear, professional 1-2 sentence confirmation explaining the generated file.",
+  "data": [
+    {{"Column1": "Value1", "Column2": "Value2"}}
+  ],
+  "content": "# Title\\n\\nMarkdown formatted report text with sections..."
+}}
+For Excel/Spreadsheet ({art_type} == "xlsx"): Provide structured rows in "data" with meaningful column names.
+For PDF/DOCX ({art_type} in ["pdf", "docx"]): Provide rich formatted markdown in "content" and optional key tables in "data".
+Return ONLY valid JSON with no extraneous text."""
+
+        llm_output_text = ""
+        try:
+            qa_resp = await asyncio.to_thread(
+                context.inference.infer_prompt,
+                prompt=prompt,
+                system_prompt="You are a structured data extractor and document synthesizer. Output valid JSON only.",
+                temperature=0.1,
+                max_tokens=1024,
+            )
+            llm_output_text = qa_resp.message.content if hasattr(qa_resp, "message") else str(qa_resp)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning("LLM extraction failed: %s", e)
+
+        synth_sec = time.perf_counter() - t_synth_0
+
+        title = f"{art_type.upper()} Export"
+        filename = f"export_{uuid.uuid4().hex[:6]}.{art_type}"
+        summary = f"Generated {art_type.upper()} file based on your request."
+        data_payload = None
+        content_payload = None
+
+        if llm_output_text:
+            json_match = re.search(r"(\{.*\})", llm_output_text, re.DOTALL)
+            if json_match:
+                try:
+                    parsed_json = json.loads(json_match.group(1))
+                    title = parsed_json.get("title") or title
+                    filename = parsed_json.get("filename") or filename
+                    summary = parsed_json.get("summary") or summary
+                    data_payload = parsed_json.get("data")
+                    content_payload = parsed_json.get("content")
+                except Exception:
+                    pass
+
+        # Fallback table synthesis if LLM returned no structured data for spreadsheet
+        if not data_payload and art_type == "xlsx":
+            fallback_rows = []
+            for chunk in req.query.replace(":", ",").split(","):
+                parts = chunk.strip().split()
+                if len(parts) >= 2:
+                    fallback_rows.append({"Item": parts[0], "Details": " ".join(parts[1:])})
+            data_payload = fallback_rows or [{"Query": req.query, "Timestamp": time.strftime("%Y-%m-%d %H:%M:%S")}]
+
+        if not content_payload and art_type in ["pdf", "docx"]:
+            content_payload = f"# {title}\n\n{req.query}\n\nGenerated by MRPL Sovereign AI Workbench."
+
+        # 3. Deterministic Compilation via ArtifactGenerationCapability
+        t_comp_0 = time.perf_counter()
+        cap_art = context.create_artifact_generation_capability()
+        art_ctx = CapabilityContext(execution_id=f"rag-art-{uuid.uuid4().hex[:8]}")
+
+        art_result: TaskResult = await asyncio.to_thread(
+            cap_art.execute,
+            parameters={
+                "artifact_type": art_type,
+                "title": title,
+                "filename": filename,
+            },
+            inputs={
+                "data": data_payload,
+                "content": content_payload,
+            },
+            context=art_ctx,
+        )
+        comp_sec = time.perf_counter() - t_comp_0
+        total_sec = time.perf_counter() - start_time
+
+        artifacts_out: List[ArtifactReferenceSchema] = []
+        for art in art_result.artifacts:
+            if art.uri and art.uri.startswith("file://"):
+                p = Path(art.uri.replace("file://", ""))
+                register_artifact(art.artifact_id, p)
+            artifacts_out.append(
+                ArtifactReferenceSchema(
+                    artifact_id=art.artifact_id,
+                    name=art.name,
+                    uri=art.uri,
+                    mime_type=art.mime_type,
+                    size_bytes=art.size_bytes,
+                    download_url=f"/api/v1/artifacts/{art.artifact_id}/download",
+                    metadata=art.metadata,
+                )
+            )
+
+        timings = {
+            "retrieval_sec": round(retrieval_sec, 3),
+            "synthesis_sec": round(synth_sec, 3),
+            "compilation_sec": round(comp_sec, 3),
+            "total_sec": round(total_sec, 3),
+        }
+
+        file_art = artifacts_out[0] if artifacts_out else None
+        formatted_answer = (
+            f"{summary}\n\n"
+            f"• **Artifact Generated:** `{file_art.name if file_art else filename}`\n"
+            f"• **Format:** `{art_type.upper()}`\n"
+            f"• **Size:** `{file_art.size_bytes:,} bytes`\n"
+            f"• **SHA-256 Provenance:** `{file_art.metadata.get('sha256', '')[:16]}...`"
+        )
+
+        return RagQAResponse(
+            query=req.query,
+            answer=formatted_answer,
+            count=len(candidates),
+            candidates=candidates,
+            timings=timings,
+            artifacts=artifacts_out,
+            capability="artifact.generate",
+            execution_id=art_ctx.execution_id,
+            status="completed",
+        )
+
+    # 4. Standard Grounded RAG Operation (pgvector retrieval + cross-encoder rerank + local LLM synthesis)
     cap = context.create_rag_capability()
     cap_ctx = CapabilityContext(execution_id=f"rag-qa-{uuid.uuid4().hex[:8]}")
 
@@ -251,6 +441,10 @@ async def qa_rag(
         count=out.get("count", len(candidates)),
         candidates=candidates,
         timings=out.get("timings", {}),
+        artifacts=[],
+        capability="retrieval.rag",
+        execution_id=cap_ctx.execution_id,
+        status="completed",
     )
 
 

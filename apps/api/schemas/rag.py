@@ -77,14 +77,21 @@ class RagQARequest(BaseModel):
     system_prompt: Optional[str] = Field(None, description="Optional custom system grounding prompt")
 
 
+from apps.api.schemas.common import ArtifactReferenceSchema
+
+
 class RagQAResponse(BaseModel):
-    """Response schema for grounded QA operation."""
+    """Response schema for grounded QA operation with capability artifact support."""
 
     query: str
     answer: str
-    count: int
-    candidates: List[RagCandidateSchema]
+    count: int = 0
+    candidates: List[RagCandidateSchema] = Field(default_factory=list)
     timings: Dict[str, float] = Field(default_factory=dict)
+    artifacts: List[ArtifactReferenceSchema] = Field(default_factory=list, description="Generated file artifacts (XLSX, PDF, etc.)")
+    capability: Optional[str] = Field("retrieval.rag", description="Underlying capability executed")
+    execution_id: Optional[str] = Field(None, description="Execution ID for capability provenance")
+    status: str = Field("completed", description="Execution status")
 
 
 class RagDocumentSummarySchema(BaseModel):
