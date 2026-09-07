@@ -1,0 +1,68 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+body {
+  background-color: #0c0e12;
+  color: #c9d1d9;
+}
+
+/* Custom terminal/IDE scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #0d0f12;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #222730;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #363d4c;
+}
+
+/* KaTeX tweaks for dark mode */
+.katex {
+  color: #f59e0b !important;
+  font-size: 1.05em;
+}
+
+.katex-display {
+  margin: 0.5em 0 !important;
+}
+
+/* Live Execution Graph neon glow aura and smooth transitions */
+@keyframes neon-pulse-amber {
+  0%, 100% {
+    box-shadow: 0 0 14px rgba(245, 158, 11, 0.65), inset 0 0 4px rgba(245, 158, 11, 0.15);
+    border-color: rgba(245, 158, 11, 0.85);
+  }
+  50% {
+    box-shadow: 0 0 8px rgba(245, 158, 11, 0.4), inset 0 0 2px rgba(245, 158, 11, 0.08);
+    border-color: rgba(245, 158, 11, 0.55);
+  }
+}
+
+.glow-amber-pipeline {
+  animation: neon-pulse-amber 1.2s ease-in-out infinite;
+  box-shadow: 0 0 12px rgba(245, 158, 11, 0.6);
+  border-color: rgba(245, 158, 11, 0.85) !important;
+}
+
+.graph-transition-smooth {
+  transition: all 0.3s ease-in-out;
+}
+
+.graph-fadeout-smooth {
+  transition: all 0.8s ease-in-out;
+}
+
