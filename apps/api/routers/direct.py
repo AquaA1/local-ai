@@ -69,12 +69,13 @@ def _to_response(capability_id: str, result: TaskResult) -> DirectCapabilityResp
         for ref in result.references
     ]
 
+    from urllib.parse import unquote
     from apps.api.routers.artifacts import register_artifact
 
     art_refs = []
     for art in result.artifacts:
         if art.uri and art.uri.startswith("file://"):
-            register_artifact(art.artifact_id, Path(art.uri.replace("file://", "")))
+            register_artifact(art.artifact_id, Path(unquote(art.uri.replace("file://", ""))))
         art_refs.append(
             ArtifactReferenceSchema(
                 artifact_id=art.artifact_id,

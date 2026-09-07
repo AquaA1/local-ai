@@ -109,7 +109,7 @@ class ArtifactGenerationCapability:
 
         artifact_id = f"art-{uuid.uuid4().hex[:12]}"
         default_filename = f"artifact_{artifact_id}.{art_format.value}"
-        filename = str(parameters.get("filename") or inputs.get("filename") or default_filename)
+        filename = str(parameters.get("filename") or inputs.get("filename") or default_filename).strip()
         if not filename.lower().endswith(f".{art_format.value}"):
             filename = f"{filename}.{art_format.value}"
 
