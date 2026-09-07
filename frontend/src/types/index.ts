@@ -14,7 +14,7 @@ export interface SessionHistoryItem {
   id: string;
   title: string;
   subtitle: string;
-  tag: 'RAG' | 'Direct' | 'Exhaustive';
+  tag: 'RAG' | 'Direct' | 'Exhaustive' | 'Context Export';
   time: string;
   active?: boolean;
 }

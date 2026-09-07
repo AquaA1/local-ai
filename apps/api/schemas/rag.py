@@ -75,6 +75,8 @@ class RagQARequest(BaseModel):
     temperature: float = Field(0.1, ge=0.0, le=1.0, description="LLM sampling temperature")
     max_tokens: int = Field(512, ge=1, le=4096, description="Maximum tokens generated in answer")
     system_prompt: Optional[str] = Field(None, description="Optional custom system grounding prompt")
+    session_id: Optional[str] = Field(None, description="Active session ID for conversational memory")
+    conversation_history: List[Dict[str, Any]] = Field(default_factory=list, description="Recent conversation turns to resolve context references")
 
 
 from apps.api.schemas.common import ArtifactReferenceSchema

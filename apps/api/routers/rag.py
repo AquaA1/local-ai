@@ -27,6 +27,40 @@ from orchestration.capabilities.base import CapabilityContext
 from orchestration.domain.results import TaskResult
 
 router = APIRouter(prefix="/rag", tags=["RAG Knowledge Base"])
+# Multi-turn session memory for conversational artifact compilation and context continuity
+_SESSION_TURNS: Dict[str, Dict[str, Any]] = {}
+_LAST_TURN_RESULT: Optional[Dict[str, Any]] = None
+
+
+def _store_turn_result(session_id: Optional[str], turn_data: Dict[str, Any]) -> None:
+    global _LAST_TURN_RESULT
+    _LAST_TURN_RESULT = turn_data
+    if session_id:
+        _SESSION_TURNS[session_id] = turn_data
+
+
+def _get_previous_turn(
+    session_id: Optional[str],
+    conversation_history: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[Dict[str, Any]]:
+    if session_id and session_id in _SESSION_TURNS:
+        return _SESSION_TURNS[session_id]
+    if _LAST_TURN_RESULT is not None:
+        return _LAST_TURN_RESULT
+    if conversation_history:
+        for turn in reversed(conversation_history):
+            role = turn.get("role") or turn.get("sender")
+            content = turn.get("content") or turn.get("text") or turn.get("answer")
+            if role in ["assistant", "ai", "bot"] and content:
+                return {
+                    "query": "Previous Report",
+                    "answer": content,
+                    "extraction": None,
+                    "candidates": [],
+                    "artifacts": [],
+                    "capability": "retrieval.rag",
+                }
+    return None
 
 
 def _clean_file_name(name: str) -> str:
@@ -242,9 +276,135 @@ async def qa_rag(
 
     start_time = time.perf_counter()
 
-    # 1. Adaptive Routing: Detect Exhaustive Document Extraction Intent
+    # 1. Conversational Artifact Export: transform preceding result/answer into downloadable file
     from rag.services.exhaustive_extractor import ExhaustiveExtractor
     from rag.storage.models import ChunkModel
+
+    if ExhaustiveExtractor.is_conversational_artifact_query(req.query):
+        prev_turn = _get_previous_turn(req.session_id, req.conversation_history)
+        if prev_turn:
+            t_comp_0 = time.perf_counter()
+            target_format = ExhaustiveExtractor.detect_target_format(req.query)
+            extractor = ExhaustiveExtractor(context.create_rag_harness().db)
+
+            # Case 1: Previous turn was an exhaustive extraction -> reuse canonical structured dataset
+            if prev_turn.get("extraction"):
+                rows, title, md_content = extractor.prepare_artifact_data(
+                    prev_turn["extraction"],
+                    prev_turn.get("query", req.query),
+                    artifact_type=target_format,
+                )
+            # Case 2: Previous turn was standard RAG answer or text report
+            else:
+                title = "Summary Report"
+                prev_query = prev_turn.get("query")
+                if prev_query and prev_query != "Previous Report":
+                    clean_title = re.sub(r"[^\w\s-]", "", prev_query).strip()
+                    if clean_title:
+                        title = clean_title.title()
+
+                md_content = prev_turn.get("answer", "")
+                rows = []
+                if target_format in ["xlsx", "csv"]:
+                    candidates_data = prev_turn.get("candidates", [])
+                    if candidates_data:
+                        for idx, c in enumerate(candidates_data, start=1):
+                            chunk_c = c.content if hasattr(c, "content") else (c.get("content") if isinstance(c, dict) else str(c))
+                            file_n = c.file_name if hasattr(c, "file_name") else (c.get("file_name", "") if isinstance(c, dict) else "")
+                            rows.append({
+                                "Item": idx,
+                                "File": file_n,
+                                "Summary": chunk_c[:200] + "..." if len(chunk_c) > 200 else chunk_c,
+                            })
+                    if not rows:
+                        rows = [{"Topic": title, "Details": md_content[:500]}]
+
+            clean_fn = re.sub(r"[^\w\-]", "_", title.lower()).strip("_")
+            filename = f"{clean_fn[:35]}.{target_format}"
+
+            cap_art = context.create_artifact_generation_capability()
+            art_ctx = CapabilityContext(execution_id=f"rag-art-conv-{uuid.uuid4().hex[:8]}")
+            art_result: TaskResult = await asyncio.to_thread(
+                cap_art.execute,
+                parameters={
+                    "artifact_type": target_format,
+                    "title": title,
+                    "filename": filename,
+                },
+                inputs={
+                    "data": rows if rows else None,
+                    "content": md_content,
+                },
+                context=art_ctx,
+            )
+            comp_sec = time.perf_counter() - t_comp_0
+
+            artifacts_out: List[ArtifactReferenceSchema] = []
+            from urllib.parse import unquote
+            for art in art_result.artifacts:
+                if art.uri and art.uri.startswith("file://"):
+                    p = Path(unquote(art.uri.replace("file://", "")))
+                    register_artifact(art.artifact_id, p)
+                artifacts_out.append(
+                    ArtifactReferenceSchema(
+                        artifact_id=art.artifact_id,
+                        name=art.name,
+                        uri=art.uri,
+                        mime_type=art.mime_type,
+                        size_bytes=art.size_bytes,
+                        download_url=f"/api/v1/artifacts/{art.artifact_id}/download",
+                        metadata=art.metadata,
+                    )
+                )
+
+            total_sec = time.perf_counter() - start_time
+            timings = {
+                "retrieval_sec": 0.0,
+                "synthesis_sec": 0.0,
+                "compilation_sec": round(comp_sec, 3),
+                "total_sec": round(total_sec, 3),
+            }
+
+            file_art = artifacts_out[0] if artifacts_out else None
+            formatted_answer = (
+                f"Generated **{target_format.upper()}** artifact directly from the previous context.\n\n"
+                f"• **Artifact:** `{file_art.name if file_art else filename}`\n"
+                f"• **Format:** `{target_format.upper()}`\n"
+                f"• **Size:** `{file_art.size_bytes:,} bytes`\n"
+                f"• **Zero Semantic Search:** Generated directly from preceding context with 0 vector retrieval loss.\n"
+                f"• **SHA-256 Provenance:** `{file_art.metadata.get('sha256', '')[:16]}...`"
+            )
+
+            prev_candidates = prev_turn.get("candidates", [])
+            norm_candidates: List[RagCandidateSchema] = []
+            for c in prev_candidates:
+                if isinstance(c, RagCandidateSchema):
+                    norm_candidates.append(c)
+                elif isinstance(c, dict):
+                    norm_candidates.append(RagCandidateSchema(**c))
+
+            response = RagQAResponse(
+                query=req.query,
+                answer=formatted_answer,
+                count=len(norm_candidates),
+                candidates=norm_candidates,
+                timings=timings,
+                artifacts=artifacts_out,
+                capability="artifact.from_context",
+                execution_id=art_ctx.execution_id,
+                status="completed",
+            )
+            _store_turn_result(req.session_id, {
+                "query": req.query,
+                "answer": formatted_answer,
+                "extraction": prev_turn.get("extraction"),
+                "candidates": norm_candidates,
+                "artifacts": artifacts_out,
+                "capability": "artifact.from_context",
+            })
+            return response
+
+    # 2. Adaptive Routing: Detect Exhaustive Document Extraction Intent
     if ExhaustiveExtractor.is_exhaustive_query(req.query):
         t_ext_0 = time.perf_counter()
         db_mgr = context.create_rag_harness().db
@@ -267,13 +427,16 @@ async def qa_rag(
             rows, title, md_content = extractor.prepare_artifact_data(extraction, req.query, artifact_type=art_type)
 
             cap_art = context.create_artifact_generation_capability()
+            doc_stem = _clean_file_name(extraction["document_name"]).replace(".pdf", "").replace(".docx", "").replace(".txt", "")
+            clean_stem = re.sub(r"[^\w\-]", "_", doc_stem.lower()).strip("_")
+
             art_ctx = CapabilityContext(execution_id=f"rag-art-{uuid.uuid4().hex[:8]}")
             art_result: TaskResult = await asyncio.to_thread(
                 cap_art.execute,
                 parameters={
                     "artifact_type": art_type,
                     "title": title,
-                    "filename": f"reva_complete_catalogue.{art_type}",
+                    "filename": f"{clean_stem[:30]}_complete_catalogue.{art_type}",
                 },
                 inputs={
                     "data": rows,
@@ -317,34 +480,36 @@ async def qa_rag(
         doc_id = extraction["document_id"]
         candidates: List[RagCandidateSchema] = []
         try:
-            with db_mgr.session() as s:
-                target_chunks = (
-                    s.query(ChunkModel)
-                    .filter(
-                        ChunkModel.document_id == doc_id,
-                        ChunkModel.chunk_index.in_([44, 45, 46, 143, 144, 147, 148, 21]),
-                    )
-                    .order_by(ChunkModel.chunk_index)
-                    .all()
-                )
-                for idx, c in enumerate(target_chunks, start=1):
-                    meta = dict(c.metadata_ or {})
-                    candidates.append(
-                        RagCandidateSchema(
-                            chunk_id=c.id,
-                            document_id=c.document_id,
-                            content=c.content,
-                            similarity_score=1.0,
-                            vector_rank=idx,
-                            rerank_score=round(5.0 - (idx * 0.1), 2),
-                            rerank_rank=idx,
-                            chunk_index=c.chunk_index,
-                            heading_path=meta.get("heading_path", ["Section 2: The Programs"]),
-                            page_numbers=meta.get("page_numbers", [20]),
-                            file_name=_clean_file_name(extraction["document_name"]),
-                            metadata=meta,
+            contributing = extraction.get("contributing_chunks", [])
+            if contributing:
+                with db_mgr.session() as s:
+                    target_chunks = (
+                        s.query(ChunkModel)
+                        .filter(
+                            ChunkModel.document_id == doc_id,
+                            ChunkModel.chunk_index.in_(contributing),
                         )
+                        .order_by(ChunkModel.chunk_index)
+                        .all()
                     )
+                    for idx, c in enumerate(target_chunks, start=1):
+                        meta = dict(c.metadata_ or {})
+                        candidates.append(
+                            RagCandidateSchema(
+                                chunk_id=c.id,
+                                document_id=c.document_id,
+                                content=c.content,
+                                similarity_score=1.0,
+                                vector_rank=idx,
+                                rerank_score=round(5.0 - (idx * 0.1), 2),
+                                rerank_rank=idx,
+                                chunk_index=c.chunk_index,
+                                heading_path=meta.get("heading_path", ["Document Content"]),
+                                page_numbers=meta.get("page_numbers", [1]),
+                                file_name=_clean_file_name(extraction["document_name"]),
+                                metadata=meta,
+                            )
+                        )
         except Exception as err:
             import logging
             logging.getLogger(__name__).warning("Failed to populate candidates for exhaustive response: %s", err)
@@ -357,7 +522,7 @@ async def qa_rag(
             "total_sec": round(total_sec, 3),
         }
 
-        return RagQAResponse(
+        resp = RagQAResponse(
             query=req.query,
             answer=formatted_answer,
             count=len(candidates),
@@ -368,6 +533,15 @@ async def qa_rag(
             execution_id=f"rag-exh-{uuid.uuid4().hex[:8]}",
             status="completed",
         )
+        _store_turn_result(req.session_id, {
+            "query": req.query,
+            "answer": formatted_answer,
+            "extraction": extraction,
+            "candidates": candidates,
+            "artifacts": artifacts_out,
+            "capability": "retrieval.exhaustive_extraction",
+        })
+        return resp
 
     # 2. Adaptive Routing: Detect Artifact Generation Intent
     if _ARTIFACT_INTENT_PATTERN.search(req.query):
@@ -517,7 +691,7 @@ Return ONLY valid JSON with no extraneous text."""
             f"• **SHA-256 Provenance:** `{file_art.metadata.get('sha256', '')[:16]}...`"
         )
 
-        return RagQAResponse(
+        resp = RagQAResponse(
             query=req.query,
             answer=formatted_answer,
             count=len(candidates),
@@ -528,6 +702,15 @@ Return ONLY valid JSON with no extraneous text."""
             execution_id=art_ctx.execution_id,
             status="completed",
         )
+        _store_turn_result(req.session_id, {
+            "query": req.query,
+            "answer": formatted_answer,
+            "extraction": None,
+            "candidates": candidates,
+            "artifacts": artifacts_out,
+            "capability": "artifact.generate",
+        })
+        return resp
 
     # 4. Standard Grounded RAG Operation (pgvector retrieval + cross-encoder rerank + local LLM synthesis)
     cap = context.create_rag_capability()
@@ -563,7 +746,7 @@ Return ONLY valid JSON with no extraneous text."""
     candidates = [
         RagCandidateSchema(**c) for c in out.get("candidates", [])
     ]
-    return RagQAResponse(
+    resp = RagQAResponse(
         query=req.query,
         answer=out.get("answer", ""),
         count=out.get("count", len(candidates)),
@@ -574,6 +757,15 @@ Return ONLY valid JSON with no extraneous text."""
         execution_id=cap_ctx.execution_id,
         status="completed",
     )
+    _store_turn_result(req.session_id, {
+        "query": req.query,
+        "answer": out.get("answer", ""),
+        "extraction": None,
+        "candidates": candidates,
+        "artifacts": [],
+        "capability": "retrieval.rag",
+    })
+    return resp
 
 
 @router.get("/documents", response_model=List[RagDocumentSummarySchema])

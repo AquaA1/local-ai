@@ -143,3 +143,32 @@ def test_query_6_pdf_catalogue_all_programs(api_client):
     assert dl_resp.status_code == 200
     assert len(dl_resp.content) == art["size_bytes"]
     assert dl_resp.content.startswith(b"%PDF")
+
+
+def test_query_7_kprl_exhaustive_no_courses(api_client):
+    """Query 7: Non-academic document (KPRL-SAFETY-HANDBOOK) must return 0 courses and zero REVA data."""
+    response = api_client.post(
+        "/api/v1/rag/qa",
+        json={
+            "query": "tell me all the courses mentioned in KPRL-SAFETY-HANDBOOK-2020.pdf",
+            "top_k": 8,
+            "top_n": 8,
+        },
+    )
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data["capability"] == "retrieval.exhaustive_extraction"
+    ans = data["answer"]
+
+    # Must explicitly state zero courses / non-academic notice
+    assert "No academic courses, degree programs, or curriculum structures were found" in ans
+    assert "non-academic document" in ans
+
+    # Must STRICTLY NOT leak any REVA courses
+    assert "Civil Engineering" not in ans
+    assert "Computer Science" not in ans
+    assert "Aerospace Engineering" not in ans
+    assert "B. Tech" not in ans
+
+    # Must have 0 candidate citations
+    assert len(data["candidates"]) == 0

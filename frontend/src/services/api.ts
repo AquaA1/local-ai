@@ -213,7 +213,9 @@ export async function executeRagQA(
   modelId: string = 'llama3.2-3b',
   topK: number = 8,
   documentId?: string,
-  activeDocName?: string
+  activeDocName?: string,
+  sessionId?: string,
+  conversationHistory?: Array<{ role: string; content: string }>
 ): Promise<RagQASuccessResult | ApiErrorResult> {
   try {
     let systemPrompt = `Active 3B Model: ${modelId}. Answer strictly grounded in industrial documentation. Match semantic intent forgivingly across minor typos, misspellings, and conversational preambles.`;
@@ -233,6 +235,12 @@ export async function executeRagQA(
 
     if (documentId) {
       payload.document_id = documentId;
+    }
+    if (sessionId) {
+      payload.session_id = sessionId;
+    }
+    if (conversationHistory && conversationHistory.length > 0) {
+      payload.conversation_history = conversationHistory;
     }
 
     const res = await fetch(`${API_BASE}/rag/qa`, {
