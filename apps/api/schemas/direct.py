@@ -11,7 +11,7 @@ class DirectVisionRequest(BaseModel):
     file_id: Optional[str] = Field(default=None, description="Uploaded file ID from /api/v1/files/upload")
     file_path: Optional[str] = Field(default=None, description="Local path to image (within allowed repository/staging root)")
     query: Optional[str] = Field(default=None, description="Inspection instruction or prompt")
-    model_id: Optional[str] = Field(default="qwen3.5-9b", description="Model ID for vision processing")
+    model_id: Optional[str] = Field(default="qwen2.5-3b", description="Model ID for vision processing")
     temperature: Optional[float] = Field(default=0.1, ge=0.0, le=2.0)
     max_tokens: Optional[int] = Field(default=512, ge=1, le=4096)
 

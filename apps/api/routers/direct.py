@@ -111,7 +111,7 @@ async def execute_direct_vision(
     cap_ctx = CapabilityContext(execution_id=f"direct-vis-{uuid.uuid4().hex[:8]}")
 
     parameters: Dict[str, Any] = {
-        "model_id": req.model_id or "qwen3.5-9b",
+        "model_id": req.model_id or "qwen2.5-3b",
         "temperature": req.temperature,
         "max_tokens": req.max_tokens,
     }

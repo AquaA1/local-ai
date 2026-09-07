@@ -140,9 +140,10 @@ class TestRagRouter(unittest.TestCase):
         resp = self.client.get("/api/v1/rag/documents")
         self.assertEqual(resp.status_code, 200)
         data = resp.json()
-        self.assertEqual(data["count"], 1)
-        self.assertEqual(data["documents"][0]["document_id"], "doc-1")
-        self.assertEqual(data["documents"][0]["chunk_count"], 65)
+        self.assertIsInstance(data, list)
+        self.assertEqual(len(data), 1)
+        self.assertEqual(data[0]["id"], "doc-1")
+        self.assertEqual(data[0]["chunk_count"], 65)
 
     def test_delete_document_endpoint(self) -> None:
         """Verify DELETE /api/v1/rag/documents/{id} deletes from indexer."""

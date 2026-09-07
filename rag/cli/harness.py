@@ -7,11 +7,12 @@ granular timings, statistics, and domain models without presentation logic.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import logging
 from pathlib import Path
 import time
 from typing import Any, Dict, List, Optional, Sequence, Union
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 
 from rag.chunking.options import ChunkingOptions
 from rag.chunking.structural import StructuralChunker
@@ -23,12 +24,15 @@ from rag.indexing.indexer import PgVectorIndexer
 from rag.ingestion.docling import SUPPORTED_EXTENSIONS, DoclingDocumentIngester
 from rag.metadata.pipeline import MetadataPipeline
 from rag.normalization.normalizer import StandardDocumentNormalizer
+from rag.pipeline import preprocess_query
 from rag.reranking.cross_encoder import CrossEncoderReranker
 from rag.reranking.models import RankedChunk, RerankerConfig
 from rag.retrieval.models import RetrievedChunk
 from rag.retrieval.retriever import PgVectorRetriever
 from rag.storage.database import DatabaseManager
 from rag.storage.models import ChunkModel, DocumentModel
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -96,6 +100,8 @@ class DocumentSummary:
     page_count: int
     chunk_count: int
     created_at: str
+    status: str = "ready"
+    stage: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -173,98 +179,156 @@ class RAGTestHarness:
     ) -> IngestionStats:
         """Execute the full ingestion pipeline: Ingest -> Normalize -> Chunk -> Enrich -> Embed -> Index."""
         path = self.validate_file_path(file_path)
+        initial_doc_id = f"doc_{path.stem}"
+
+        def _update_doc_status(status_str: str, stage_str: str, page_cnt: int = 0) -> None:
+            try:
+                with self.db.session() as session:
+                    rec = session.scalar(select(DocumentModel).where(DocumentModel.id == initial_doc_id))
+                    if rec:
+                        meta = dict(rec.metadata_ or {})
+                        meta["status"] = status_str
+                        meta["stage"] = stage_str
+                        if page_cnt > 0:
+                            meta["page_count"] = page_cnt
+                        rec.metadata_ = meta
+                        session.commit()
+                    else:
+                        rec = DocumentModel(
+                            id=initial_doc_id,
+                            content="",
+                            metadata_={
+                                "file_name": path.name,
+                                "format": path.suffix.lstrip(".").lower(),
+                                "status": status_str,
+                                "stage": stage_str,
+                                "page_count": page_cnt,
+                            },
+                        )
+                        session.add(rec)
+                        session.commit()
+            except Exception as e:
+                logger.warning("Failed to update initial doc status: %s", e)
 
         # Check if document already exists to determine action (created vs updated)
         with self.db.session() as session:
             existing = session.scalar(
-                select(DocumentModel.id).where(DocumentModel.id == str(path.stem))
+                select(DocumentModel.id).where(DocumentModel.id == initial_doc_id)
             )
             action = "updated" if existing else "created"
+
+        _update_doc_status("processing", "Ingesting via Docling...")
 
         def _notify(step_name: str, step_idx: int, total_steps: int = 6) -> None:
             if progress_callback:
                 progress_callback(step_name, step_idx, total_steps)
+            if step_idx <= 4:
+                _update_doc_status("processing", step_name)
+            elif step_idx == 5:
+                _update_doc_status("indexing", step_name)
 
-        # [1/6] Ingestion
-        _notify("Ingesting via Docling", 1)
-        t0 = time.perf_counter()
-        ingested_doc = self.ingester.ingest(path)
-        t_ingest = time.perf_counter() - t0
+        try:
+            # [1/6] Ingestion
+            _notify("Ingesting via Docling", 1)
+            t0 = time.perf_counter()
+            ingested_doc = self.ingester.ingest(path)
+            t_ingest = time.perf_counter() - t0
 
-        # [2/6] Normalization
-        _notify("Normalizing document structure", 2)
-        t0 = time.perf_counter()
-        norm_doc = self.normalizer.normalize(ingested_doc)
-        t_norm = time.perf_counter() - t0
+            # [2/6] Normalization
+            _notify("Normalizing document structure", 2)
+            t0 = time.perf_counter()
+            norm_doc = self.normalizer.normalize(ingested_doc)
+            t_norm = time.perf_counter() - t0
 
-        # [3/6] Chunking
-        _notify("Structural chunking", 3)
-        t0 = time.perf_counter()
-        raw_chunks = self.chunker.chunk(norm_doc)
-        t_chunk = time.perf_counter() - t0
+            # [3/6] Chunking
+            _notify("Structural chunking", 3)
+            t0 = time.perf_counter()
+            raw_chunks = self.chunker.chunk(norm_doc)
+            t_chunk = time.perf_counter() - t0
 
-        # [4/6] Metadata enrichment
-        _notify("Enriching metadata & provenance", 4)
-        t0 = time.perf_counter()
-        doc_metadata = MetadataPipeline.extract_document_metadata(norm_doc)
-        enriched_chunks = [
-            MetadataPipeline.enrich_chunk(c, document_metadata=doc_metadata)
-            for c in raw_chunks
-        ]
-        t_meta = time.perf_counter() - t0
+            # [4/6] Metadata enrichment
+            _notify("Enriching metadata & provenance", 4)
+            t0 = time.perf_counter()
+            doc_metadata = MetadataPipeline.extract_document_metadata(norm_doc)
+            enriched_chunks = [
+                MetadataPipeline.enrich_chunk(c, document_metadata=doc_metadata)
+                for c in raw_chunks
+            ]
+            t_meta = time.perf_counter() - t0
 
-        # [5/6] Embedding
-        _notify("Generating embeddings via Nomic", 5)
-        t0 = time.perf_counter()
-        embeddings = self.embedding_service.embed_chunks(enriched_chunks)
-        t_embed = time.perf_counter() - t0
+            # [5/6] Embedding (CPU / low-memory batching)
+            _notify("Generating embeddings via Nomic", 5)
+            t0 = time.perf_counter()
+            embeddings = self.embedding_service.embed_chunks(enriched_chunks, batch_size=8)
+            t_embed = time.perf_counter() - t0
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except ImportError:
+                pass
 
-        # [6/6] Indexing
-        _notify("Persisting to PostgreSQL + pgvector", 6)
-        t0 = time.perf_counter()
-        domain_doc = Document(
-            id=norm_doc.document_id,
-            content=norm_doc.text,
-            metadata=doc_metadata.to_dict(),
-        )
-        indexed_count = self.indexer.index_document(
-            document=domain_doc,
-            chunks=enriched_chunks,
-            embeddings=embeddings,
-        )
-        t_index = time.perf_counter() - t0
+            # [6/6] Indexing
+            _notify("Persisting to PostgreSQL + pgvector", 6)
+            t0 = time.perf_counter()
+            final_meta = doc_metadata.to_dict()
+            final_meta["status"] = "ready"
+            final_meta["stage"] = "Ready"
+            domain_doc = Document(
+                id=norm_doc.document_id,
+                content=norm_doc.text,
+                metadata=final_meta,
+            )
+            indexed_count = self.indexer.index_document(
+                document=domain_doc,
+                chunks=enriched_chunks,
+                embeddings=embeddings,
+            )
+            t_index = time.perf_counter() - t0
 
-        total_time = t_ingest + t_norm + t_chunk + t_meta + t_embed + t_index
+            # Clean up initial placeholder record if norm_doc.document_id is different
+            if norm_doc.document_id != initial_doc_id:
+                try:
+                    with self.db.session() as session:
+                        session.execute(delete(DocumentModel).where(DocumentModel.id == initial_doc_id))
+                        session.commit()
+                except Exception:
+                    pass
 
-        timings = IngestionTimings(
-            ingestion_sec=t_ingest,
-            normalization_sec=t_norm,
-            chunking_sec=t_chunk,
-            metadata_sec=t_meta,
-            embedding_sec=t_embed,
-            indexing_sec=t_index,
-            total_sec=total_time,
-        )
+            total_time = t_ingest + t_norm + t_chunk + t_meta + t_embed + t_index
 
-        return IngestionStats(
-            document_id=norm_doc.document_id,
-            file_name=path.name,
-            file_path=str(path),
-            format=norm_doc.format,
-            page_count=norm_doc.page_count,
-            element_count=len(norm_doc.elements),
-            chunk_count=len(enriched_chunks),
-            embedding_count=len(embeddings),
-            indexed_count=indexed_count,
-            timings=timings,
-            action=action,
-        )
+            timings = IngestionTimings(
+                ingestion_sec=t_ingest,
+                normalization_sec=t_norm,
+                chunking_sec=t_chunk,
+                metadata_sec=t_meta,
+                embedding_sec=t_embed,
+                indexing_sec=t_index,
+                total_sec=total_time,
+            )
+
+            return IngestionStats(
+                document_id=norm_doc.document_id,
+                file_name=path.name,
+                file_path=str(path),
+                format=norm_doc.format,
+                page_count=norm_doc.page_count,
+                element_count=len(norm_doc.elements),
+                chunk_count=len(enriched_chunks),
+                embedding_count=len(embeddings),
+                indexed_count=indexed_count,
+                timings=timings,
+                action=action,
+            )
+        except Exception as exc:
+            _update_doc_status("error", f"Failed: {str(exc)}")
+            raise
 
     def query(
         self,
         question: str,
-        top_k: int = 10,
-        top_n: int = 5,
+        top_k: int = 20,
+        top_n: int = 8,
         document_id: Optional[str] = None,
         similarity_threshold: Optional[float] = None,
     ) -> QueryResult:
@@ -273,14 +337,15 @@ class RAGTestHarness:
             raise ValueError("Question must be a non-empty string")
 
         clean_q = question.strip()
+        search_q = preprocess_query(clean_q) or clean_q
 
-        # 1. Query Embedding
+        # 1. Query Embedding (using cleaned query to ignore conversational fluff)
         t0 = time.perf_counter()
         # NomicEmbeddingModel adheres to EmbeddingModel
-        query_vector = self.embedding_service.model.embed_query(clean_q)
+        query_vector = self.embedding_service.model.embed_query(search_q)
         t_embed = time.perf_counter() - t0
 
-        # 2. Vector Retrieval (PgVectorRetriever)
+        # 2. Vector Retrieval (PgVectorRetriever with expanded initial candidate window)
         t0 = time.perf_counter()
         retrieved_candidates = self.retriever.retrieve(
             query_vector=query_vector,
@@ -345,6 +410,12 @@ class RAGTestHarness:
                 file_name = meta_dict.get("file_name", doc_id)
                 fmt = meta_dict.get("format", "")
                 page_count = int(meta_dict.get("page_count", 0))
+                raw_status = meta_dict.get("status")
+                if raw_status:
+                    status = raw_status
+                else:
+                    status = "ready" if chunk_count > 0 else "processing"
+                stage = meta_dict.get("stage", "Ready" if status == "ready" else "Processing...")
 
                 summaries.append(
                     DocumentSummary(
@@ -354,6 +425,8 @@ class RAGTestHarness:
                         page_count=page_count,
                         chunk_count=int(chunk_count),
                         created_at=created_at.strftime("%Y-%m-%d %H:%M:%S") if created_at else "N/A",
+                        status=status,
+                        stage=stage,
                     )
                 )
 

@@ -18,7 +18,7 @@ class LlamaCppProviderSettings:
     """Settings for the llama.cpp HTTP client provider."""
     base_url: str = "http://127.0.0.1:8080"
     timeout_seconds: float = 60.0
-    default_alias: str = "qwen3.5-9b"
+    default_alias: str = "llama3.2-3b"
 
 
 @dataclass(frozen=True)

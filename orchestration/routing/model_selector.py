@@ -8,7 +8,7 @@ from orchestration.routing.types import ModelTier
 
 DEFAULT_TIER_MAPPING: Dict[ModelTier, str] = {
     ModelTier.LIGHTWEIGHT: "qwen3.5-0.8b",
-    ModelTier.REASONING: "qwen3.5-9b",
+    ModelTier.REASONING: "llama3.2-3b",
 }
 
 

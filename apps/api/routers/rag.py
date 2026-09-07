@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+import re
 from typing import Any, Dict, List, Optional
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 
 from apps.api.dependencies import get_app_context, get_staging_dir
 from apps.api.schemas.rag import (
@@ -26,6 +27,14 @@ from orchestration.capabilities.base import CapabilityContext
 from orchestration.domain.results import TaskResult
 
 router = APIRouter(prefix="/rag", tags=["RAG Knowledge Base"])
+
+
+def _clean_file_name(name: str) -> str:
+    """Strip leading UUID or file-* prefix to render human-readable file names."""
+    if not name:
+        return ""
+    clean = re.sub(r"^(?:file-)?[0-9a-fA-F]{8,}(?:-[0-9a-fA-F]{4,})*[-_]", "", name)
+    return clean or name
 
 
 def _resolve_file(file_id: Optional[str], file_path: Optional[str], staging_dir: Path, repo_root: Path) -> Path:
@@ -64,6 +73,7 @@ def _resolve_file(file_id: Optional[str], file_path: Optional[str], staging_dir:
 @router.post("/ingest", response_model=RagIngestResponse)
 async def ingest_document(
     req: RagIngestRequest,
+    background_tasks: BackgroundTasks,
     context: AppContext = Depends(get_app_context),
     staging_dir: Path = Depends(get_staging_dir),
 ) -> RagIngestResponse:
@@ -71,7 +81,58 @@ async def ingest_document(
     repo_root = getattr(context.core, "repo_root", Path.cwd())
     resolved_path = _resolve_file(req.file_id, req.file_path, staging_dir, repo_root)
 
+    clean_name = _clean_file_name(resolved_path.name)
+    initial_doc_id = f"doc_{resolved_path.stem}"
     harness = context.create_rag_harness()
+
+    if req.async_mode:
+        def _pre_register() -> None:
+            from rag.storage.models import DocumentModel
+            from sqlalchemy import select
+            try:
+                with harness.db.session() as session:
+                    rec = session.scalar(select(DocumentModel).where(DocumentModel.id == initial_doc_id))
+                    if not rec:
+                        session.add(
+                            DocumentModel(
+                                id=initial_doc_id,
+                                content="",
+                                metadata_={
+                                    "file_name": resolved_path.name,
+                                    "format": resolved_path.suffix.lstrip(".").lower(),
+                                    "status": "processing",
+                                    "stage": "Ingesting via Docling...",
+                                    "page_count": 0,
+                                },
+                            )
+                        )
+                        session.commit()
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning("Failed to pre-register document: %s", e)
+
+        await asyncio.to_thread(_pre_register)
+
+        def _run_ingestion() -> None:
+            try:
+                harness.ingest_document(resolved_path)
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).error("Background ingestion failed for %s: %s", resolved_path, e)
+
+        background_tasks.add_task(_run_ingestion)
+
+        return RagIngestResponse(
+            document_id=initial_doc_id,
+            file_name=clean_name or resolved_path.name,
+            format=resolved_path.suffix.lstrip(".").lower(),
+            page_count=0,
+            chunk_count=0,
+            status="processing",
+            stage="Ingesting via Docling...",
+            action="created",
+            timings={},
+        )
 
     try:
         stats = await asyncio.to_thread(harness.ingest_document, resolved_path)
@@ -83,10 +144,12 @@ async def ingest_document(
 
     return RagIngestResponse(
         document_id=stats.document_id,
-        file_name=stats.file_name,
+        file_name=clean_name or stats.file_name,
         format=stats.format,
         page_count=stats.page_count,
         chunk_count=stats.chunk_count,
+        status="ready",
+        stage="Ready",
         action=stats.action,
         timings={
             "ingestion_sec": stats.timings.ingestion_sec,
@@ -109,10 +172,13 @@ async def search_rag(
     cap = context.create_rag_capability()
     cap_ctx = CapabilityContext(execution_id=f"rag-search-{uuid.uuid4().hex[:8]}")
 
+    initial_k = max(req.top_k, 20) if req.top_k else 20
+    post_rerank_n = req.top_n if req.top_n and req.top_n >= 6 else 8
+
     parameters: Dict[str, Any] = {
         "operation": "search",
-        "top_k": req.top_k,
-        "top_n": req.top_n,
+        "top_k": initial_k,
+        "top_n": post_rerank_n,
     }
     if req.document_id:
         parameters["document_id"] = req.document_id
@@ -149,10 +215,13 @@ async def qa_rag(
     cap = context.create_rag_capability()
     cap_ctx = CapabilityContext(execution_id=f"rag-qa-{uuid.uuid4().hex[:8]}")
 
+    initial_k = max(req.top_k, 20) if req.top_k else 20
+    post_rerank_n = req.top_n if req.top_n and req.top_n >= 6 else 8
+
     parameters: Dict[str, Any] = {
         "operation": "qa",
-        "top_k": req.top_k,
-        "top_n": req.top_n,
+        "top_k": initial_k,
+        "top_n": post_rerank_n,
         "temperature": req.temperature,
         "max_tokens": req.max_tokens,
     }
@@ -185,26 +254,46 @@ async def qa_rag(
     )
 
 
-@router.get("/documents", response_model=RagDocumentListResponse)
+@router.get("/documents", response_model=List[RagDocumentSummarySchema])
 async def list_documents(
     context: AppContext = Depends(get_app_context),
-) -> RagDocumentListResponse:
-    """List all indexed documents and their chunk counts in the persistent RAG store."""
+) -> List[RagDocumentSummarySchema]:
+    """List all indexed documents and their chunk counts directly from PostgreSQL, deduplicated by clean name."""
     harness = context.create_rag_harness()
     summaries = await asyncio.to_thread(harness.list_documents)
 
-    doc_list = [
-        RagDocumentSummarySchema(
-            document_id=s.document_id,
-            file_name=s.file_name,
-            format=s.format,
-            page_count=s.page_count,
-            chunk_count=s.chunk_count,
-            created_at=s.created_at,
+    seen_names: set[str] = set()
+    result: List[RagDocumentSummarySchema] = []
+
+    # Sort so that documents with chunks > 0 or status == 'ready' come first
+    sorted_summaries = sorted(
+        summaries,
+        key=lambda s: (getattr(s, "chunk_count", 0) > 0, getattr(s, "status", "") == "ready"),
+        reverse=True,
+    )
+
+    for s in sorted_summaries:
+        clean_name = _clean_file_name(s.file_name)
+        if clean_name in seen_names:
+            continue
+        seen_names.add(clean_name)
+        status_val = getattr(s, "status", "ready")
+        stage_val = getattr(s, "stage", None)
+        result.append(
+            RagDocumentSummarySchema(
+                id=s.document_id,
+                document_id=s.document_id,
+                file_name=clean_name or s.file_name,
+                total_chunks=s.chunk_count,
+                chunk_count=s.chunk_count,
+                created_at=s.created_at,
+                status=status_val,
+                stage=stage_val,
+                format=s.format,
+                page_count=s.page_count,
+            )
         )
-        for s in summaries
-    ]
-    return RagDocumentListResponse(count=len(doc_list), documents=doc_list)
+    return result
 
 
 @router.delete("/documents/{document_id}")

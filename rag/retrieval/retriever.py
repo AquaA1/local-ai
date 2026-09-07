@@ -107,7 +107,7 @@ class PgVectorRetriever(VectorRetriever):
     def retrieve(
         self,
         query_vector: Sequence[float],
-        top_k: int = 5,
+        top_k: int = 20,
         document_id: Optional[str] = None,
         similarity_threshold: Optional[float] = None,
         filters: Optional[Dict[str, Any]] = None,
@@ -116,7 +116,7 @@ class PgVectorRetriever(VectorRetriever):
 
         Args:
             query_vector: Dense float vector representing the query embedding.
-            top_k: Maximum number of candidate chunks to return (default: 5).
+            top_k: Maximum number of candidate chunks to return (default: 20).
             document_id: Optional document ID to restrict retrieval scope.
             similarity_threshold: Optional minimum cosine similarity score [-1.0, 1.0].
             filters: Optional dictionary of JSONB metadata key-value constraints.

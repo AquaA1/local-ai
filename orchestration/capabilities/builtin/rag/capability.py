@@ -8,6 +8,7 @@ Provides a unified capability ('retrieval.rag') for:
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 from connectors import InferenceConnector
@@ -17,6 +18,14 @@ from orchestration.domain.references import DataReference
 from orchestration.domain.results import TaskResult
 
 logger = logging.getLogger(__name__)
+
+
+def _clean_file_name(name: str) -> str:
+    """Strip leading UUID or file-* prefix to render human-readable file names."""
+    if not name:
+        return ""
+    clean = re.sub(r"^(?:file-)?[0-9a-fA-F]{8,}(?:-[0-9a-fA-F]{4,})*[-_]", "", name)
+    return clean or name
 
 
 class RagRetrievalCapability:
@@ -78,12 +87,12 @@ class RagRetrievalCapability:
                     "top_k": {
                         "type": "integer",
                         "description": "Number of initial vector candidates retrieved from pgvector.",
-                        "default": 10,
+                        "default": 20,
                     },
                     "top_n": {
                         "type": "integer",
                         "description": "Number of final candidates returned after cross-encoder reranking.",
-                        "default": 3,
+                        "default": 8,
                     },
                     "document_id": {
                         "type": "string",
@@ -132,8 +141,8 @@ class RagRetrievalCapability:
             ),
             parameter_schema={
                 "operation": {"type": "string", "enum": ["search", "qa"], "default": "qa"},
-                "top_k": {"type": "integer", "default": 10},
-                "top_n": {"type": "integer", "default": 3},
+                "top_k": {"type": "integer", "default": 20},
+                "top_n": {"type": "integer", "default": 8},
                 "document_id": {"type": "string"},
                 "min_score": {"type": "number"},
                 "temperature": {"type": "number", "default": 0.1},
@@ -191,17 +200,20 @@ class RagRetrievalCapability:
         if operation not in ("search", "qa"):
             raise ValueError(f"Invalid operation '{operation}'. Supported operations: 'search', 'qa'.")
 
-        top_k = int(parameters.get("top_k", 10))
-        top_n = int(parameters.get("top_n", 3))
+        top_k = int(parameters.get("top_k", 20))
+        top_n = int(parameters.get("top_n", 8))
         document_id = parameters.get("document_id")
         min_score = parameters.get("min_score")
         if min_score is not None:
             min_score = float(min_score)
 
         harness = self._get_harness()
+        # Guarantee initial dense vector retrieval candidate window is at least 20
+        # so typos, conversational filler, and lexical mismatch don't drop relevant chunks
+        retrieval_k = max(top_k, 20)
         query_result = harness.query(
             question=query,
-            top_k=top_k,
+            top_k=retrieval_k,
             top_n=top_n,
             document_id=document_id,
         )
@@ -215,6 +227,8 @@ class RagRetrievalCapability:
         candidate_dicts: List[Dict[str, Any]] = []
         for c in candidates:
             meta = dict(c.metadata or {})
+            raw_name = meta.get("file_name", "")
+            clean_name = _clean_file_name(raw_name)
             candidate_dicts.append({
                 "chunk_id": c.chunk_id,
                 "document_id": c.document_id,
@@ -226,7 +240,7 @@ class RagRetrievalCapability:
                 "chunk_index": c.chunk_index,
                 "heading_path": meta.get("heading_path", []),
                 "page_numbers": meta.get("page_numbers", []),
-                "file_name": meta.get("file_name", ""),
+                "file_name": clean_name or raw_name,
                 "metadata": meta,
             })
 
@@ -274,7 +288,7 @@ class RagRetrievalCapability:
                 heading_str = " > ".join(heading) if isinstance(heading, list) else str(heading or "General")
                 pages = c.get("page_numbers", [])
                 page_str = f"Page(s) {', '.join(map(str, pages))}" if pages else "Page: unknown"
-                doc_name = c.get("file_name") or c.get("document_id", "doc")
+                doc_name = _clean_file_name(c.get("file_name") or c.get("document_id", "doc"))
                 citation_header = f"[Source {i}: {doc_name} | {page_str} | Section: {heading_str}]"
                 context_blocks.append(f"{citation_header}\n{c['content']}")
 
@@ -286,7 +300,10 @@ class RagRetrievalCapability:
                 "1. Only state facts, numbers, equipment tags, limits, and procedures explicitly present in the context.\n"
                 "2. If the answer cannot be determined from the provided context, state clearly: "
                 "'The provided context does not contain sufficient information to answer this question.' Do not guess or hallucinate.\n"
-                "3. When asserting facts, cite the source section or document."
+                "3. When asserting facts, cite the source section or document.\n"
+                "4. Be forgiving of user typos, minor misspellings, colloquial phrasing, and conversational preambles (such as 'can you tell me', 'what is', 'please find'). "
+                "Match semantic intent forgivingly across the retrieved document context, preserving critical named entities like leadership, Chancellors, equipment codes, and operational rules.\n"
+                "5. Active Document Context: If the user asks about an entity or topic completely outside the scope of the active document context, explicitly clarify which document is currently active and state that the requested entity is not covered in it."
             )
             system_prompt = parameters.get("system_prompt") or default_system
             user_prompt = f"Document Context:\n{formatted_context}\n\nQuestion: {query}"

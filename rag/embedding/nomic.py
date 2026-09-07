@@ -44,12 +44,12 @@ class NomicEmbeddingModel(EmbeddingModel, Embedder):
         model_name: str = "nomic-ai/nomic-embed-text-v1.5",
         normalize: bool = True,
         backend: Optional[Callable[[List[str]], List[List[float]]]] = None,
-        device: Optional[str] = None,
+        device: Optional[str] = "cpu",
     ) -> None:
         self._model_name = model_name
         self.normalize = normalize
         self._custom_backend = backend
-        self.device = device
+        self.device = device or "cpu"
         self._loaded_model: Optional[Any] = None
 
     @property
@@ -143,21 +143,34 @@ class NomicEmbeddingModel(EmbeddingModel, Embedder):
             try:
                 raw_embeddings = model.encode(
                     formatted_texts,
+                    batch_size=8,
                     normalize_embeddings=self.normalize,
                     convert_to_numpy=True,
                 ).tolist()
             except Exception as exc:
                 if "CUDA out of memory" in str(exc) or "OutOfMemoryError" in type(exc).__name__:
-                    import torch
-                    torch.cuda.empty_cache()
+                    try:
+                        import torch
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    except ImportError:
+                        pass
                     model.to("cpu")
                     raw_embeddings = model.encode(
                         formatted_texts,
+                        batch_size=8,
                         normalize_embeddings=self.normalize,
                         convert_to_numpy=True,
                     ).tolist()
                 else:
                     raise
+            finally:
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except ImportError:
+                    pass
 
         result: List[List[float]] = []
         for idx, emb in enumerate(raw_embeddings):

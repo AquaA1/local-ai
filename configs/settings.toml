@@ -6,12 +6,12 @@ models_dir = "models"
 configs_dir = "configs/models"
 
 [providers.llama_cpp]
-base_url = "http://127.0.0.1:8080"
+base_url = "http://127.0.0.1:11434"
 timeout_seconds = 60
-default_alias = "qwen3.5-9b"
+default_alias = "llama3.2-3b"
 
 [database]
-url = "postgresql+psycopg://postgres:postgres@localhost:5432/local_ai"
+url = "postgresql+psycopg://raguser:ragpassword@localhost:5432/ragdb"
 pool_size = 5
 max_overflow = 10
 echo = false

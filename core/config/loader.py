@@ -1,6 +1,7 @@
-"""TOML Configuration loader and validator using Python 3.12 tomllib."""
-
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 

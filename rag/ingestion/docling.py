@@ -77,6 +77,15 @@ class DoclingDocumentIngester(DocumentIngester):
             # Explicitly disable remote parsing / remote OCR services to guarantee offline safety
             pipeline_options.enable_remote_services = False
 
+            # Explicitly enforce CPU for OCR and acceleration to preserve RTX 4050 VRAM for Ollama
+            try:
+                if hasattr(pipeline_options, "accelerator_options"):
+                    pipeline_options.accelerator_options.device = "cpu"
+                if hasattr(pipeline_options, "ocr_options") and hasattr(pipeline_options.ocr_options, "device"):
+                    pipeline_options.ocr_options.device = "cpu"
+            except Exception:
+                pass
+
             self._converter = DocumentConverter(
                 format_options={
                     InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)

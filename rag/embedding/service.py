@@ -25,7 +25,7 @@ class ChunkEmbeddingService:
         if model is None:
             from rag.embedding.nomic import NomicEmbeddingModel
 
-            model = NomicEmbeddingModel()
+            model = NomicEmbeddingModel(device="cpu")
         self.model = model
 
     def embed_chunk(self, chunk: Chunk) -> EmbeddingResult:
@@ -65,7 +65,7 @@ class ChunkEmbeddingService:
     def embed_chunks(
         self,
         chunks: Sequence[Chunk],
-        batch_size: int = 32,
+        batch_size: int = 8,
     ) -> List[EmbeddingResult]:
         """Generate embeddings for a sequence of Chunks in configurable batches.
 
@@ -73,7 +73,7 @@ class ChunkEmbeddingService:
 
         Args:
             chunks: Sequence of domain Chunk objects to embed.
-            batch_size: Number of chunks to process per model inference call.
+            batch_size: Number of chunks to process per model inference call (default: 8).
 
         Returns:
             List of EmbeddingResult objects matching the input sequence order.
@@ -124,5 +124,13 @@ class ChunkEmbeddingService:
                         is_normalized=self.model.is_normalized,
                     )
                 )
+
+            # Prevent CUDA memory accumulation between chunk batches
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except ImportError:
+                pass
 
         return results

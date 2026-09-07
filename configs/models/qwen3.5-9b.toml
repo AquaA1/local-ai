@@ -5,7 +5,7 @@ id = "qwen3.5-9b"
 display_name = "Qwen 3.5 9B Q4_K_M"
 format = "gguf"
 path = "models/gguf/Qwen3.5-9B-Q4_K_M.gguf"
-aliases = ["qwen3.5", "qwen-9b", "default"]
+aliases = ["qwen3.5", "qwen-9b"]
 supported_providers = ["llama_cpp"]
 roles = ["general", "coding"]
 
